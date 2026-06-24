@@ -51,3 +51,20 @@ https://YOUR-GITHUB-USERNAME.github.io/YOUR-REPO-NAME/
 
 For now, edit the `RAW_SURVEYS` array in `src/App.jsx`, then commit and push the change.
 GitHub Pages will rebuild automatically.
+
+## Updating survey data after publishing
+
+The dashboard now includes an **Import CSV/JSON** button in the top control bar.
+
+Supported import formats:
+
+- **CSV** exported from the dashboard using **Export CSV**
+- **JSON** exported from the dashboard using **Export JSON**
+
+Imported rows are merged into the dashboard and saved in the browser's local storage. This means the imported data will stay available on that computer/browser after refresh.
+
+Important: because GitHub Pages is free static hosting, the import button does **not** write new data back to GitHub automatically. To make new survey results permanently public for everyone, import the rows, click **Export JSON**, and then use that JSON as the updated source data in the repo.
+
+## Raw Data tab
+
+The Raw Data screen now has a horizontal scrollbar under the table so all 18 question columns and comments can be viewed.
