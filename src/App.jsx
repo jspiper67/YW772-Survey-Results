@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, Legend, CartesianGrid } from "recharts";
 
 // ─── DATA ─────────────────────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ const QUESTIONS = [
   { id: 18, section: "Overall Review",                      short: "COMSEC Comfort Increased",    text: "Has your overall comfort level with COMSEC increased?" },
 ];
 
-const RAW_SURVEYS = [
+const BASE_SURVEYS = [
   // ── 2026-0001 (Dec 4 2025) ──────────────────────────────────────
   { course:"2026-0001", date:"2025-12-04", ccnStart:2,  ccnEnd:6,   responses:["C","C","C","C","C","C","C","C","C","C","C","C","C","C","C","C","C","S"], comment:"" },
   { course:"2026-0001", date:"2025-12-04", ccnStart:1,  ccnEnd:5,   responses:["C","S","C","S","C","S","C","S","C","S","C","C","C","C","C","C","C","S"], comment:"Thank You! This training was a real BEAR! You are very patient.\nFrom my perspective, it would be very helpful to have physical visuals." },
@@ -123,6 +123,96 @@ function exportCSV(surveys) {
   a.download = "YW772_Survey_Data.csv"; a.click();
 }
 
+
+function exportJSON(surveys) {
+  const blob = new Blob([JSON.stringify(surveys, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "YW772_Survey_Data.json";
+  a.click();
+}
+
+function parseCSV(text) {
+  const rows = [];
+  let row = [], cur = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i], next = text[i + 1];
+    if (ch === '"' && inQuotes && next === '"') { cur += '"'; i++; continue; }
+    if (ch === '"') { inQuotes = !inQuotes; continue; }
+    if (ch === "," && !inQuotes) { row.push(cur); cur = ""; continue; }
+    if ((ch === "\n" || ch === "\r") && !inQuotes) {
+      if (ch === "\r" && next === "\n") i++;
+      row.push(cur); cur = "";
+      if (row.some(v => String(v).trim() !== "")) rows.push(row);
+      row = [];
+      continue;
+    }
+    cur += ch;
+  }
+  row.push(cur);
+  if (row.some(v => String(v).trim() !== "")) rows.push(row);
+  return rows;
+}
+
+function normalizeResponse(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (["c", "complete", "completely"].includes(v)) return "C";
+  if (["s", "somewhat"].includes(v)) return "S";
+  if (["n", "needs", "needs improvement", "needs_improvement"].includes(v)) return "N";
+  return "";
+}
+
+function normalizeSurvey(row) {
+  const responses = row.responses || QUESTIONS.map(q => row[`Q${q.id}`] ?? row[`q${q.id}`] ?? row[`Q${q.id} - ${q.short}`]);
+  return {
+    course: String(row.course ?? row.Course ?? "").trim(),
+    date: String(row.date ?? row.Date ?? "").trim(),
+    ccnStart: row.ccnStart ?? row["CCN Start"] ?? row["CCN↑"] ?? row.start ?? null,
+    ccnEnd: row.ccnEnd ?? row["CCN End"] ?? row["CCN↓"] ?? row.end ?? null,
+    responses: responses.map(normalizeResponse),
+    comment: String(row.comment ?? row.Comment ?? "").trim(),
+  };
+}
+
+function toNumberOrNull(value) {
+  if (value === "" || value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function surveyKey(s) {
+  return [s.course, s.date, s.ccnStart ?? "", s.ccnEnd ?? "", s.responses.join(""), s.comment].join("|");
+}
+
+function mergeSurveys(base, incoming) {
+  const map = new Map(base.map(s => [surveyKey(s), s]));
+  incoming.forEach(s => map.set(surveyKey(s), s));
+  return [...map.values()];
+}
+
+function parseSurveyFileText(text, filename = "") {
+  const lower = filename.toLowerCase();
+  let surveys = [];
+  if (lower.endsWith(".json")) {
+    const parsed = JSON.parse(text);
+    surveys = Array.isArray(parsed) ? parsed : parsed.surveys || [];
+  } else {
+    const rows = parseCSV(text);
+    if (rows.length < 2) return [];
+    const headers = rows[0].map(h => String(h).trim());
+    surveys = rows.slice(1).map(values => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = values[i] ?? ""; });
+      return obj;
+    });
+  }
+  return surveys.map(normalizeSurvey).filter(s => {
+    s.ccnStart = toNumberOrNull(s.ccnStart);
+    s.ccnEnd = toNumberOrNull(s.ccnEnd);
+    return s.course && s.date && s.responses.length === QUESTIONS.length && s.responses.every(Boolean);
+  });
+}
+
 // ─── COMPONENTS ───────────────────────────────────────────────────────────────
 function StatCard({ label, value, sub, color }) {
   return (
@@ -174,6 +264,15 @@ export default function App() {
   const [ccnSort,      setCcnSort]      = useState({ col:"date", dir:"desc" });
   const [dataSort,     setDataSort]     = useState({ col:"date", dir:"desc" });
   const [cmtSort,      setCmtSort]      = useState({ col:"date", dir:"desc" });
+  const [surveys,      setSurveys]      = useState(() => {
+    try {
+      const saved = localStorage.getItem("yw772-surveys");
+      return saved ? mergeSurveys(BASE_SURVEYS, JSON.parse(saved)) : BASE_SURVEYS;
+    } catch {
+      return BASE_SURVEYS;
+    }
+  });
+  const [uploadMsg,    setUploadMsg]    = useState("");
 
   function toggleSort(setFn, current, col) {
     setFn(prev => prev.col === col
@@ -181,11 +280,47 @@ export default function App() {
       : { col, dir: "desc" });
   }
 
-  const courses = useMemo(() => ["ALL", ...unique(RAW_SURVEYS.map(s => s.course))], []);
+
+  async function handleImport(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const imported = parseSurveyFileText(text, file.name);
+      if (!imported.length) {
+        setUploadMsg("No valid survey rows found. Use the dashboard CSV/JSON format.");
+        return;
+      }
+      setSurveys(prev => mergeSurveys(prev, imported));
+      setUploadMsg(`Imported ${imported.length} survey row${imported.length === 1 ? "" : "s"} from ${file.name}.`);
+      setFilterCourse("ALL");
+    } catch (err) {
+      setUploadMsg(`Import failed: ${err.message}`);
+    } finally {
+      e.target.value = "";
+    }
+  }
+
+  function resetImportedData() {
+    setSurveys(BASE_SURVEYS);
+    setUploadMsg("Imported rows cleared. Original built-in data restored.");
+    setFilterCourse("ALL");
+  }
+
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("yw772-surveys", JSON.stringify(surveys));
+    } catch {
+      // Ignore storage failures. The dashboard still works for the current session.
+    }
+  }, [surveys]);
+
+  const courses = useMemo(() => ["ALL", ...unique(surveys.map(s => s.course))], [surveys]);
 
   const filtered = useMemo(() =>
-    filterCourse === "ALL" ? RAW_SURVEYS : RAW_SURVEYS.filter(s => s.course === filterCourse),
-    [filterCourse]);
+    filterCourse === "ALL" ? surveys : surveys.filter(s => s.course === filterCourse),
+    [filterCourse, surveys]);
 
   const tallied       = useMemo(() => tally(filtered), [filtered]);
   const ccn           = useMemo(() => ccnStats(filtered), [filtered]);
@@ -193,7 +328,7 @@ export default function App() {
   const overallPctC   = Math.round(tallied.reduce((a, b) => a + b.pctC, 0) / tallied.length);
 
   const commentRows   = filtered.filter(s => s.comment?.trim());
-  const commentsCount = RAW_SURVEYS.filter(s => s.comment?.trim()).length;
+  const commentsCount = surveys.filter(s => s.comment?.trim()).length;
 
   // Sorted datasets
   const sortedCCN  = useMemo(() => sortRows(filtered.filter(s => s.ccnStart != null), ccnSort),  [filtered, ccnSort]);
@@ -202,14 +337,14 @@ export default function App() {
 
   const trendData = useMemo(() => {
     const byC = {};
-    RAW_SURVEYS.forEach(s => { if (!byC[s.course]) byC[s.course] = []; byC[s.course].push(s); });
+    surveys.forEach(s => { if (!byC[s.course]) byC[s.course] = []; byC[s.course].push(s); });
     return Object.entries(byC).map(([course, surveys]) => {
       const t = tally(surveys);
       const overall = Math.round(t.reduce((a, b) => a + b.pctC, 0) / t.length);
       const ccns = ccnStats(surveys);
       return { course, overall, avgGain: ccns ? parseFloat(ccns.avgGain) : null, n: surveys.length };
     });
-  }, []);
+  }, [surveys]);
 
   const sections = unique(QUESTIONS.map(q => q.section));
   const tabs = [
@@ -228,7 +363,9 @@ export default function App() {
     hSub:      { fontSize:13, opacity:.8, marginTop:4 },
     controls:  { display:"flex", alignItems:"center", gap:12, padding:"12px 28px", background:"#fff", borderBottom:"1px solid #e2e8f0", flexWrap:"wrap" },
     select:    { padding:"6px 12px", borderRadius:6, border:"1px solid #cbd5e1", fontSize:13, background:"#fff" },
-    btnExport: { padding:"6px 14px", borderRadius:6, background:"#2563eb", color:"#fff", border:"none", cursor:"pointer", fontSize:13, fontWeight:600, marginLeft:"auto" },
+    btnExport: { padding:"6px 14px", borderRadius:6, background:"#2563eb", color:"#fff", border:"none", cursor:"pointer", fontSize:13, fontWeight:600 },
+    btnSecondary: { padding:"6px 14px", borderRadius:6, background:"#fff", color:"#2563eb", border:"1px solid #93c5fd", cursor:"pointer", fontSize:13, fontWeight:600 },
+    btnDanger: { padding:"6px 14px", borderRadius:6, background:"#fff", color:"#b91c1c", border:"1px solid #fecaca", cursor:"pointer", fontSize:13, fontWeight:600 },
     tabs:      { display:"flex", gap:0, padding:"0 28px", background:"#fff", borderBottom:"1px solid #e2e8f0" },
     tab: (a)=> { return { padding:"10px 16px", fontSize:13, fontWeight:600, cursor:"pointer", border:"none", background:"none", borderBottom: a?"2px solid #2563eb":"2px solid transparent", color: a?"#2563eb":"#64748b" }; },
     body:      { padding:"20px 28px", maxWidth:1200, margin:"0 auto" },
@@ -254,8 +391,8 @@ export default function App() {
             <div style={S.hSub}>Encryption Services • Student Satisfaction Tracking</div>
           </div>
           <div style={{ textAlign:"right", fontSize:13, opacity:.85 }}>
-            <div>{RAW_SURVEYS.length} total surveys</div>
-            <div>{unique(RAW_SURVEYS.map(s=>s.course)).length} course iterations</div>
+            <div>{surveys.length} total surveys</div>
+            <div>{unique(surveys.map(s=>s.course)).length} course iterations</div>
           </div>
         </div>
       </div>
@@ -267,8 +404,15 @@ export default function App() {
           {courses.map(c => <option key={c} value={c}>{c==="ALL"?"All Courses":c}</option>)}
         </select>
         <span style={{ fontSize:12, color:"#94a3b8" }}>{totalResponses} surveys shown</span>
+        <label style={{ ...S.btnSecondary, marginLeft:"auto" }}>
+          ⬆ Import CSV/JSON
+          <input type="file" accept=".csv,.json" onChange={handleImport} style={{ display:"none" }} />
+        </label>
         <button style={S.btnExport} onClick={() => exportCSV(filtered)}>⬇ Export CSV</button>
+        <button style={S.btnSecondary} onClick={() => exportJSON(surveys)}>⬇ Export JSON</button>
+        {surveys.length !== BASE_SURVEYS.length && <button style={S.btnDanger} onClick={resetImportedData}>Reset Imported</button>}
       </div>
+      {uploadMsg && <div style={{ padding:"8px 28px", background:"#eff6ff", color:"#1e40af", fontSize:13, borderBottom:"1px solid #bfdbfe" }}>{uploadMsg}</div>}
 
       {/* TABS */}
       <div style={S.tabs}>
@@ -482,16 +626,16 @@ export default function App() {
 
         {/* ── RAW DATA ── */}
         {activeTab === "data" && (
-          <div style={S.card}>
-            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
+          <div style={{ ...S.card, overflow:"hidden" }}>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14, gap:12, flexWrap:"wrap" }}>
               <div style={S.cardTitle}>All Survey Records</div>
-              <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                <span style={{ fontSize:12, color:"#94a3b8" }}>Click a header to sort</span>
+              <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+                <span style={{ fontSize:12, color:"#94a3b8" }}>Click a header to sort. Use the horizontal scrollbar below the table.</span>
                 <button style={S.btnExport} onClick={() => exportCSV(filtered)}>⬇ Export CSV</button>
               </div>
             </div>
-            <div style={{ overflowX:"auto" }}>
-              <table style={{ ...S.table, minWidth:900 }}>
+            <div style={{ overflowX:"auto", overflowY:"visible", maxWidth:"100%", paddingBottom:12, WebkitOverflowScrolling:"touch" }}>
+              <table style={{ ...S.table, minWidth:1750, tableLayout:"auto" }}>
                 <thead>
                   <tr>
                     <SortTh label="Course" col="course" sort={dataSort} onSort={col => toggleSort(setDataSort, dataSort, col)} />
@@ -514,7 +658,7 @@ export default function App() {
                           <span style={S.badge(r)}>{r}</span>
                         </td>
                       ))}
-                      <td style={{ ...S.td, maxWidth:200, fontSize:12, color:"#64748b" }}>{s.comment || ""}</td>
+                      <td style={{ ...S.td, minWidth:280, maxWidth:360, fontSize:12, color:"#64748b" }}>{s.comment || ""}</td>
                     </tr>
                   ))}
                 </tbody>
